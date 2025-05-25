@@ -9,322 +9,451 @@
 
 
 
-name: Discord 通知
+name: Discord Notification
 
 on:
   workflow_dispatch:
-  # push:
-    # branches: [ '**' ]
+  push:
+    branches: [ '**' ]
   pull_request:
-    types: [ opened, reopened, closed ]
+    types: [opened, edited, closed, reopened]
   issues:
-    types: [ opened, reopened, closed ]
+    types: [opened, reopened, closed]
   issue_comment:
-    types: [ created, edited ]
+    types: [created, edited]
   release:
-    types: [ published ]
+    types: [published]
 
 jobs:
   notify:
     runs-on: ubuntu-latest
 
     steps:
-    - name: Checkout
-      uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-    #######################################################################
-    # PUSH
-    # pull requestがあるため必要ないと判断
-    #######################################################################
-    - name: Prepare Push
-      if: ${{ github.event_name == 'push' }}
-      id: prep_push
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const corePush = core;
-          const p        = context.payload;
-          const head     = p.head_commit || {};
-          const commits  = p.commits || [];
-          const truncate = (t,m)=>(t&&t.length>m)?t.slice(0,m-3)+'...':(t||'');
+      #######################################################################
+      # 共通ユーティリティをステップ毎に定義
+      #######################################################################
+      # 文字列を最大長で切り、改行やクォートを JSON 文字列向けにエスケープして出力
+      - name: util-functions
+        id: util
+        run: |
+          cat <<'EOF' > /tmp/truncate_escape.js
+          exports.trEsc = (txt, max) => {
+            const s = (txt ?? '').toString();
+            const t = s.length > max ? s.slice(0, max - 3) + '...' : s;
+            // JSON.stringify で改行, ダブルクォート, バックスラッシュを \n \" などに変換
+            return JSON.stringify(t).slice(1, -1);
+          };
+          EOF
 
-          corePush.setOutput('n',   commits.length);
-          corePush.setOutput('id',  head.id   || '');
-          corePush.setOutput('url', head.url  || '');
+      #######################################################################
+      # PUSH
+      #######################################################################
+      - name: Prepare Push
+        if: ${{ github.event_name == 'push' }}
+        id: prep_push
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const corePush = core;
+            const p = context.payload;
+            const { owner, repo } = context.repo;
+            const { trEsc } = require('/tmp/truncate_escape.js');
 
-          // 改行を "\n" に置換して JSON パースエラーを回避
-          const rawMsg  = truncate(head.message,1024);
-          const safeMsg = rawMsg.replace(/(\r?\n)+/g, '\\n');
-          corePush.setOutput('msg', safeMsg);
+            const headCommitFromPayload = p.head_commit || {};
+            const pushedCommitsFromPayload = p.commits || []; // These don't have stats directly
 
-          corePush.setOutput('ts',  head.timestamp || new Date().toISOString());
-          // 追加・削除行数を計算
-          let added = 0, deleted = 0;
-          for (const c of commits) {
-            added  += c.added   ? c.added.length   : 0;
-            deleted+= c.removed ? c.removed.length : 0;
-          }
-          corePush.setOutput('add', added);
-          corePush.setOutput('del', deleted);
+            corePush.setOutput('n', pushedCommitsFromPayload.length);
+            corePush.setOutput('id', headCommitFromPayload.id || '');
+            corePush.setOutput('url', headCommitFromPayload.url || '');
+            corePush.setOutput('msg', trEsc(headCommitFromPayload.message, 1024));
+            corePush.setOutput('ts', headCommitFromPayload.timestamp || new Date().toISOString());
 
-    - name: Discord Embed Push
-      if: ${{ github.event_name == 'push' }}
-      uses: Ilshidur/action-discord@0.3.2
-      env:
-        DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-        DISCORD_USERNAME: 'GitHub Actions'
-        DISCORD_AVATAR:   'https://github.githubassets.com/favicon.png'
-        DISCORD_EMBEDS: |-
-          [
-            {
-              "author": {
-                "name":      "${{ github.actor }}",
-                "icon_url":  "${{ github.event.sender.avatar_url }}",
-                "url":       "https://github.com/${{ github.actor }}"
-              },
-              "title":       ":arrow_right: Push to `${{ github.repository }}`",
-              "url":         "${{ steps.prep_push.outputs.url }}",
-              "description": "ブランチ `${{ github.ref_name }}` にコミットがプッシュされました。",
-              "color":       3447003,
-              "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
-              "fields": [
-                { "name": "コミット数",    "value": "${{ steps.prep_push.outputs.n }} 件",                             "inline": true },
-                { "name": "追加/削除行数", "value": "+${{ steps.prep_push.outputs.add }}/-${{ steps.prep_push.outputs.del }}", "inline": true },
-                { "name": "コミットID",    "value": "[`${{ steps.prep_push.outputs.id }}`](${{ steps.prep_push.outputs.url }})", "inline": false },
-                { "name": "メッセージ",    "value": "${{ steps.prep_push.outputs.msg }}",                             "inline": false }
-              ],
-              "footer":      { "text": "GitHub Actions" },
-              "timestamp":   "${{ steps.prep_push.outputs.ts }}"
+            let totalAdditions = 0;
+            let totalDeletions = 0;
+
+            const baseSha = p.before;
+            const headSha = p.after;
+
+            // Only proceed if headSha is not the zero SHA (e.g. not a branch deletion)
+            if (headSha && headSha !== '0000000000000000000000000000000000000000') {
+              if (baseSha === '0000000000000000000000000000000000000000') {
+                // New branch/tag push. Sum stats from each pushed commit.
+                // The pushedCommitsFromPayload only has {id, message, etc.}, not stats.
+                // We need to fetch each one.
+                core.info(`New branch/tag push. Fetching stats for ${pushedCommitsFromPayload.length} commits.`);
+                for (const commitRef of pushedCommitsFromPayload) {
+                  try {
+                    const { data: commitData } = await github.rest.repos.getCommit({
+                      owner,
+                      repo,
+                      ref: commitRef.id,
+                    });
+                    if (commitData.stats) {
+                      totalAdditions += commitData.stats.additions;
+                      totalDeletions += commitData.stats.deletions;
+                    }
+                  } catch (error) {
+                    core.warning(`Failed to fetch commit ${commitRef.id} for new branch stats: ${error.message}`);
+                  }
+                }
+              } else {
+                // Existing branch push (or force push)
+                core.info(`Existing branch push. Comparing ${baseSha}...${headSha}`);
+                try {
+                  const response = await github.rest.repos.compareCommitsWithBasehead({
+                    owner,
+                    repo,
+                    basehead: `${baseSha}...${headSha}`
+                  });
+                  const comparison = response.data;
+
+                  if (comparison && comparison.files && comparison.files.length > 0) {
+                    core.info(`Found ${comparison.files.length} changed files in comparison. Summing their additions/deletions.`);
+                    for (const file of comparison.files) {
+                      totalAdditions += (file.additions || 0);
+                      totalDeletions += (file.deletions || 0);
+                    }
+                  } else if (comparison && comparison.commits && comparison.commits.length > 0) {
+                    // Fallback: if comparison.files is empty, try summing stats from individual commits in the comparison
+                    core.warning(`comparison.files was empty or not found. Falling back to summing stats from ${comparison.commits.length} commits in comparison.`);
+                    for (const commit of comparison.commits) {
+                      totalAdditions += (commit.stats?.additions || 0);
+                      totalDeletions += (commit.stats?.deletions || 0);
+                    }
+                  } else {
+                    core.warning(`No changed files or commits found in comparison between ${baseSha} and ${headSha}. Line counts will likely be 0.`);
+                  }
+                } catch (error) {
+                  core.warning(`Failed to compare commits ${baseSha}...${headSha}: ${error.message}`);
+                  core.error(error); // Log the full error object for more detailed debugging
+                }
+              }
+            } else {
+              core.info('Branch/tag deletion push, or invalid headSha. Skipping line count.');
             }
-          ]
-      with:
-        args: ''
 
-    #######################################################################
-    # ISSUE
-    #######################################################################
-    - name: Prepare Issue
-      if: ${{ github.event_name == 'issues' }}
-      id: prep_issue
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const coreIssue = core;
-          const is        = context.payload.issue || {};
-          const truncate  = (t,m)=>(t&&t.length>m)?t.slice(0,m-3)+'...':(t||'');
-          const joinOrNA  = a=>a&&a.length?a.join(', '):'なし';
+            corePush.setOutput('add', totalAdditions);
+            corePush.setOutput('del', totalDeletions);
 
-          coreIssue.setOutput('title', truncate(is.title,256));
-
-          // 改行を "\n" に置換
-          const rawBody   = truncate(is.body,4096);
-          const safeBody  = rawBody.replace(/(\r?\n)+/g, '\\n');
-          coreIssue.setOutput('body', safeBody);
-
-          coreIssue.setOutput('labels', joinOrNA((is.labels||[]).map(l=>l.name)));
-          coreIssue.setOutput('assns',  joinOrNA((is.assignees||[]).map(a=>a.login)));
-          coreIssue.setOutput('mile',   is.milestone?.title||'なし');
-          coreIssue.setOutput('url',    is.html_url||'');
-          coreIssue.setOutput('ts',     is.updated_at||new Date().toISOString());
-
-    - name: Discord Embed Issue
-      if: ${{ github.event_name == 'issues' }}
-      uses: Ilshidur/action-discord@0.3.2
-      env:
-        DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-        DISCORD_USERNAME: 'GitHub Actions'
-        DISCORD_AVATAR:   'https://github.githubassets.com/favicon.png'
-        DISCORD_EMBEDS: |-
-          [
-            {
-              "author": {
-                "name":      "${{ github.actor }}",
-                "icon_url":  "${{ github.event.sender.avatar_url }}",
-                "url":       "https://github.com/${{ github.actor }}"
-              },
-              "title":       ":page_with_curl: Issue #${{ github.event.issue.number }} ${{ github.event.action }}",
-              "url":         "${{ steps.prep_issue.outputs.url }}",
-              "color":       15844367,
-              "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
-              "fields": [
-                { "name": "タイトル",    "value": "${{ steps.prep_issue.outputs.title }}",  "inline": false },
-                { "name": "コメント", "value": "${{ steps.prep_issue.outputs.body }}",   "inline": false },
-                { "name": "Labels",      "value": "${{ steps.prep_issue.outputs.labels }}", "inline": true  },
-                { "name": "Assignees",   "value": "${{ steps.prep_issue.outputs.assns }}",  "inline": true  },
-                { "name": "Milestone",   "value": "${{ steps.prep_issue.outputs.mile }}",   "inline": true  }
-              ],
-              "footer":      { "text": "GitHub Actions" },
-              "timestamp":   "${{ steps.prep_issue.outputs.ts }}"
-            }
-          ]
-      with:
-        args: ''
-
-    #######################################################################
-    # PULL REQUEST
-    #######################################################################
-    - name: Prepare PR
-      if: ${{ github.event_name == 'pull_request' }}
-      id: prep_pr
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const corePr     = core;
-          const pr         = context.payload.pull_request||{};
-          const truncate   = (t,m)=>(t&&t.length>m)?t.slice(0,m-3)+'...':(t||'');
-          const joinOrNA   = a=>a&&a.length?a.join(', '):'なし';
-
-          corePr.setOutput('title', truncate(pr.title,256));
-
-          // 改行を "\n" に置換
-          const rawPrBody  = truncate(pr.body,4096);
-          const safePrBody = rawPrBody.replace(/(\r?\n)+/g, '\\n');
-          corePr.setOutput('body', safePrBody);
-
-          corePr.setOutput('labels', joinOrNA((pr.labels||[]).map(l=>l.name)));
-          corePr.setOutput('assns',  joinOrNA((pr.assignees||[]).map(a=>a.login)));
-          corePr.setOutput('url',    pr.html_url||'');
-          corePr.setOutput('ts',     pr.updated_at||new Date().toISOString());
-
-    - name: Discord Embed PR
-      if: ${{ github.event_name == 'pull_request' }}
-      uses: Ilshidur/action-discord@0.3.2
-      env:
-        DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-        DISCORD_USERNAME: 'GitHub Actions'
-        DISCORD_AVATAR:   'https://github.githubassets.com/favicon.png'
-        DISCORD_EMBEDS: |-
-          [
-            {
-              "author": {
-                "name":      "${{ github.actor }}",
-                "icon_url":  "${{ github.event.sender.avatar_url }}",
-                "url":       "https://github.com/${{ github.actor }}"
-              },
-              "title":       ":twisted_rightwards_arrows: PR #${{ github.event.pull_request.number }} ${{ github.event.action }}",
-              "url":         "${{ steps.prep_pr.outputs.url }}",
-              "description": "${{ steps.prep_pr.outputs.body }}",
-              "color":       10181046,
-              "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
-              "fields": [
-                { "name": "タイトル",  "value": "${{ steps.prep_pr.outputs.title }}",  "inline": false },
-                { "name": "Labels",    "value": "${{ steps.prep_pr.outputs.labels }}", "inline": true  },
-                { "name": "Assignees", "value": "${{ steps.prep_pr.outputs.assns }}",  "inline": true  }
-              ],
-              "footer":      { "text": "GitHub Actions" },
-              "timestamp":   "${{ steps.prep_pr.outputs.ts }}"
-            }
-          ]
-      with:
-        args: ''
-
-    #######################################################################
-    # ISSUE COMMENT
-    #######################################################################
-    - name: Prepare Issue Comment
-      if: ${{ github.event_name == 'issue_comment' }}
-      id: prep_comment
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const coreComment = core;
-          const cmt        = context.payload.comment || {};
-          const issue      = context.payload.issue || {};
-          const truncate   = (t,m)=>(t&&t.length>m)?t.slice(0,m-3)+'...':(t||'');
-
-          // コメント本文をトランケート＆改行を "\n" に置換
-          const rawBody   = truncate(cmt.body,2048);
-          const safeBody  = rawBody.replace(/(\r?\n)+/g, '\\n');
-          coreComment.setOutput('body', safeBody);
-
-          coreComment.setOutput('url',    cmt.html_url || '');
-          coreComment.setOutput('ts',     cmt.updated_at || new Date().toISOString());
-          coreComment.setOutput('issue_number', issue.number || '');
-          coreComment.setOutput('issue_title', truncate(issue.title, 128));
-
-    - name: Discord Embed Issue Comment
-      if: ${{ github.event_name == 'issue_comment' }}
-      uses: Ilshidur/action-discord@0.3.2
-      env:
-        DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-        DISCORD_USERNAME: 'GitHub Actions'
-        DISCORD_AVATAR:   'https://github.githubassets.com/favicon.png'
-        DISCORD_EMBEDS: |-
-          [
-            {
-              "author": {
-              "name":      "${{ github.actor }}",
-              "icon_url":  "${{ github.event.sender.avatar_url }}",
-              "url":       "https://github.com/${{ github.actor }}"
-              },
-              "title":       ":speech_balloon: Issue #${{ steps.prep_comment.outputs.issue_number }} コメント ${{ github.event.action }}",
-              "url":         "${{ steps.prep_comment.outputs.url }}",
-              "color":       3066993,
-              "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
-              "fields": [
-              { "name": "Issue タイトル", "value": "${{ steps.prep_comment.outputs.issue_title }}", "inline": false },
-              { "name": "コメント",       "value": "${{ steps.prep_comment.outputs.body }}",        "inline": false }
-              ],
-              "footer":      { "text": "GitHub Actions" },
-              "timestamp":   "${{ steps.prep_comment.outputs.ts }}"
+      - name: Discord Embed Push
+        if: ${{ github.event_name == 'push' }}
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USERNAME: "GitHub Actions"
+          DISCORD_AVATAR: "https://github.githubassets.com/favicon.png"
+          DISCORD_EMBEDS: >-
+            [
+              {
+                "author": {
+                  "name":     "${{ github.actor }}",
+                  "icon_url": "${{ github.event.sender.avatar_url }}",
+                  "url":      "https://github.com/${{ github.actor }}"
+                },
+                "title":       ":arrow_right: **Push** to `${{ github.repository }}`",
+                "url":         "${{ steps.prep_push.outputs.url }}",
+                "description": "*Branch:* `${{ github.ref_name }}` has new commits.",
+                "color":       3447003,
+                "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
+                "fields": [
+                  {
+                    "name": "**Commits**",
+                    "value": "**${{ steps.prep_push.outputs.n }}**",
+                    "inline": true
+                  },
+                  {
+                    "name": "**Added/Deleted Lines**",
+                    "value": "`+${{ steps.prep_push.outputs.add }}/-${{ steps.prep_push.outputs.del }}`",
+                    "inline": true
+                  },
+                  {
+                    "name": "**Commit ID**",
+                    "value": "[`${{ steps.prep_push.outputs.id }}`](${{ steps.prep_push.outputs.url }})",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Message**",
+                    "value": "```git\n${{ steps.prep_push.outputs.msg }}\n```",
+                    "inline": false
+                  }
+                ],
+                "footer":    { "text": "GitHub Actions" },
+                "timestamp": "${{ steps.prep_push.outputs.ts }}"
               }
             ]
-      with:
-        args: ''
+        with:
+          args: ""
 
-    #######################################################################
-    # RELEASE
-    #######################################################################
-    - name: Prepare Release
-      if: ${{ github.event_name == 'release' }}
-      id: prep_rel
-      uses: actions/github-script@v6
-      with:
-        script: |
-          const coreRel = core;
-          const r       = context.payload.release||{};
-          const truncate= (t,m)=>(t&&t.length>m)?t.slice(0,m-3)+'...':(t||'');
+      #######################################################################
+      # ISSUE
+      #######################################################################
+      - name: Prepare Issue
+        if: ${{ github.event_name == 'issues' }}
+        id: prep_issue
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const coreIssue = core;
+            const is        = context.payload.issue || {};
+            const { trEsc } = require('/tmp/truncate_escape.js');
+            // join labels and assignees as bullet list
+            const listize  = arr => arr && arr.length
+              ? arr.map(x => `- ${x}`).join('\n')
+              : 'None';
 
-          coreRel.setOutput('name',   truncate(r.name,256));
-          coreRel.setOutput('assets', r.assets?.length ?? 0);
-          coreRel.setOutput('draft',  r.draft?'true':'false');
+            coreIssue.setOutput('title', trEsc(is.title, 256));
+            coreIssue.setOutput('body',  trEsc(is.body, 500));
+            coreIssue.setOutput('labels', trEsc(listize((is.labels||[]).map(l=>l.name)), 512));
+            coreIssue.setOutput('assns',  trEsc(listize((is.assignees||[]).map(a=>a.login)), 512));
+            coreIssue.setOutput('mile',   is.milestone?.title || 'None');
+            coreIssue.setOutput('url',    is.html_url || '');
+            coreIssue.setOutput('ts',     is.updated_at || new Date().toISOString());
 
-          // 改行を "\n" に置換
-          const rawBody   = truncate(r.body,4096);
-          const safeBody  = rawBody.replace(/(\r?\n)+/g, '\\n');
-          coreRel.setOutput('body',   safeBody);
-
-          coreRel.setOutput('url',    r.html_url||'');
-          coreRel.setOutput('ts',     r.published_at||new Date().toISOString());
-
-    - name: Discord Embed Release
-      if: ${{ github.event_name == 'release' }}
-      uses: Ilshidur/action-discord@0.3.2
-      env:
-        DISCORD_WEBHOOK:  ${{ secrets.DISCORD_WEBHOOK_URL }}
-        DISCORD_USERNAME: 'GitHub Actions'
-        DISCORD_AVATAR:   'https://github.githubassets.com/favicon.png'
-        DISCORD_EMBEDS: |-
-          [
-            {
+      - name: Discord Embed Issue
+        if: ${{ github.event_name == 'issues' }}
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USERNAME: "GitHub Actions"
+          DISCORD_AVATAR: "https://github.githubassets.com/favicon.png"
+          DISCORD_EMBEDS: >-
+            [
+              {
               "author": {
-                "name":      "${{ github.actor }}",
-                "icon_url":  "${{ github.event.sender.avatar_url }}",
-                "url":       "https://github.com/${{ github.actor }}"
+                "name":     "${{ github.actor }}",
+                "icon_url": "${{ github.event.sender.avatar_url }}",
+                "url":      "https://github.com/${{ github.actor }}"
               },
-              "title":       ":bookmark_tabs: Release `${{ github.event.release.tag_name }}` ${{ github.event.action }}",
-              "url":         "${{ steps.prep_rel.outputs.url }}",
-              "description": "${{ steps.prep_rel.outputs.body }}",
-              "color":       3447003,
-              "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
+              "title":       ":page_with_curl: **Issue #${{ github.event.issue.number }} ${{ github.event.action }}**",
+              "url":         "${{ steps.prep_issue.outputs.url }}",
+              "color":       15844367,
               "fields": [
-                { "name":"リリース名","value":"${{ steps.prep_rel.outputs.name }}","inline":false },
-                { "name":"Assets",   "value":"${{ steps.prep_rel.outputs.assets }} 個","inline":true  },
-                { "name":"Draft?",   "value":"${{ steps.prep_rel.outputs.draft }}","inline":true  }
+                {
+                "name": "**Issue Title**",
+                "value": "```git\n${{ steps.prep_issue.outputs.title }}\n```",
+                "inline": false
+                },
+                {
+                "name": "**Description**",
+                "value": "```md\n${{ steps.prep_issue.outputs.body }}\n```",
+                "inline": false
+                },
+                {
+                "name": "**Labels**",
+                "value": "${{ steps.prep_issue.outputs.labels }}",
+                "inline": false
+                },
+                {
+                "name": "**Assignees**",
+                "value": "${{ steps.prep_issue.outputs.assns }}",
+                "inline": false
+                }
               ],
-              "footer":      { "text":"GitHub Actions" },
-              "timestamp":   "${{ steps.prep_rel.outputs.ts }}"
-            }
-          ]
-      with:
-        args: ''
+              "footer":    { "text": "GitHub Actions" },
+              "timestamp": "${{ steps.prep_issue.outputs.ts }}"
+              }
+            ]
+        with:
+          args: ""
+
+      #######################################################################
+      # ISSUE COMMENT
+      #######################################################################
+      - name: Prepare Issue Comment
+        if: ${{ github.event_name == 'issue_comment' }}
+        id: prep_comment
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const coreComment = core;
+            const cmt         = context.payload.comment || {};
+            const issue       = context.payload.issue   || {};
+            const { trEsc }   = require('/tmp/truncate_escape.js');
+
+            coreComment.setOutput('issue_number', issue.number || '');
+            coreComment.setOutput('issue_title',  trEsc(issue.title, 256));
+            coreComment.setOutput('body',         trEsc(cmt.body,   1024));
+            coreComment.setOutput('url',          cmt.html_url || '');
+            coreComment.setOutput('ts',           cmt.updated_at || new Date().toISOString());
+
+      - name: Discord Embed Issue Comment
+        if: ${{ github.event_name == 'issue_comment' }}
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USERNAME: "GitHub Actions"
+          DISCORD_AVATAR: "https://github.githubassets.com/favicon.png"
+          DISCORD_EMBEDS: >-
+            [
+              {
+                "author": {
+                  "name":     "${{ github.actor }}",
+                  "icon_url": "${{ github.event.sender.avatar_url }}",
+                  "url":      "https://github.com/${{ github.actor }}"
+                },
+                "title":       ":speech_balloon: **Comment on Issue #${{ steps.prep_comment.outputs.issue_number }}**",
+                "url":         "${{ steps.prep_comment.outputs.url }}",
+                "color":       3066993,
+                "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
+                "fields": [
+                  {
+                    "name": "**Issue Title**",
+                    "value": "```\n${{ steps.prep_comment.outputs.issue_title }}\n```",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Comment**",
+                    "value": "```md\n${{ steps.prep_comment.outputs.body }}\n```",
+                    "inline": false
+                  }
+                ],
+                "footer":      { "text": "GitHub Actions" },
+                "timestamp":   "${{ steps.prep_comment.outputs.ts }}"
+              }
+            ]
+        with:
+          args: ""
+
+      #######################################################################
+      # PULL REQUEST
+      #######################################################################
+      - name: Prepare PR
+        if: ${{ github.event_name == 'pull_request' }}
+        id: prep_pr
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const corePr    = core;
+            const pr        = context.payload.pull_request || {};
+            const { trEsc } = require('/tmp/truncate_escape.js');
+            const listize   = arr => arr && arr.length
+              ? arr.map(x => `- ${x}`).join('\n')
+              : 'None';
+
+            corePr.setOutput('title', trEsc(pr.title, 256));
+            corePr.setOutput('body',  trEsc(pr.body, 500));
+            corePr.setOutput('labels', listize((pr.labels||[]).map(l=>l.name)));
+            corePr.setOutput('assns',  listize((pr.assignees||[]).map(a=>a.login)));
+            corePr.setOutput('url',    pr.html_url || '');
+            corePr.setOutput('ts',     pr.updated_at || new Date().toISOString());
+
+      - name: Discord Embed PR
+        if: ${{ github.event_name == 'pull_request' }}
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USERNAME: "GitHub Actions"
+          DISCORD_AVATAR: "https://github.githubassets.com/favicon.png"
+          DISCORD_EMBEDS: >-
+            [
+              {
+                "author": {
+                  "name":     "${{ github.actor }}",
+                  "icon_url": "${{ github.event.sender.avatar_url }}",
+                  "url":      "https://github.com/${{ github.actor }}"
+                },
+                "title":       ":twisted_rightwards_arrows: **PR #${{ github.event.pull_request.number }} ${{ github.event.action }}**",
+                "url":         "${{ steps.prep_pr.outputs.url }}",
+
+                "color":       10181046,
+                "fields": [
+                  {
+                    "name": "**PR Title**",
+                    "value": "```${{ steps.prep_pr.outputs.title }}```",
+                    "inline": false
+                  },
+                  {
+                    "name": "**URL**",
+                    "value": "[`PR #${{ github.event.pull_request.number }}`](${{ steps.prep_pr.outputs.url }})",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Description**",
+                    "value": "```\n${{ steps.prep_pr.outputs.body }}\n```",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Labels**",
+                    "value": "${{ steps.prep_pr.outputs.labels }}",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Assignees**",
+                    "value": "${{ steps.prep_pr.outputs.assns }}",
+                    "inline": false
+                  }
+                ],
+                "footer":    { "text": "GitHub Actions" },
+                "timestamp": "${{ steps.prep_pr.outputs.ts }}"
+              }
+            ]
+        with:
+          args: ""
+
+      #######################################################################
+      # RELEASE
+      #######################################################################
+      - name: Prepare Release
+        if: ${{ github.event_name == 'release' }}
+        id: prep_rel
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const coreRel = core;
+            const r       = context.payload.release || {};
+            const { trEsc } = require('/tmp/truncate_escape.js');
+
+            coreRel.setOutput('tag',   r.tag_name || '');
+            coreRel.setOutput('name',  trEsc(r.name,  256));
+            coreRel.setOutput('body',  trEsc(r.body,  1024));
+            coreRel.setOutput('assets', r.assets?.length ?? 0);
+            coreRel.setOutput('draft',  r.draft ? 'Yes' : 'No');
+            coreRel.setOutput('url',    r.html_url || '');
+            coreRel.setOutput('ts',     r.published_at || new Date().toISOString());
+
+      - name: Discord Embed Release
+        if: ${{ github.event_name == 'release' }}
+        uses: Ilshidur/action-discord@0.3.2
+        env:
+          DISCORD_WEBHOOK: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_USERNAME: "GitHub Actions"
+          DISCORD_AVATAR: "https://github.githubassets.com/favicon.png"
+          DISCORD_EMBEDS: >-
+            [
+              {
+                "author": {
+                  "name":     "${{ github.actor }}",
+                  "icon_url": "${{ github.event.sender.avatar_url }}",
+                  "url":      "https://github.com/${{ github.actor }}"
+                },
+                "title":       ":bookmark_tabs: **Release `${{ steps.prep_rel.outputs.tag }}` published**",
+                "url":         "${{ steps.prep_rel.outputs.url }}",
+                "description": "```md\n${{ steps.prep_rel.outputs.body }}\n```",
+                "color":       3447003,
+                "thumbnail":   { "url": "${{ github.event.sender.avatar_url }}" },
+                "fields": [
+                  {
+                    "name": "**Release Name**",
+                    "value": "${{ steps.prep_rel.outputs.name }}",
+                    "inline": false
+                  },
+                  {
+                    "name": "**Assets Count**",
+                    "value": "${{ steps.prep_rel.outputs.assets }}",
+                    "inline": true
+                  },
+                  {
+                    "name": "**Draft?**",
+                    "value": "${{ steps.prep_rel.outputs.draft }}",
+                    "inline": true
+                  }
+                ],
+                "footer":      { "text": "GitHub Actions" },
+                "timestamp":   "${{ steps.prep_rel.outputs.ts }}"
+              }
+            ]
+        with:
+          args: ""
